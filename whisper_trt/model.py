@@ -164,9 +164,11 @@ class WhisperTRT(nn.Module):
             
         audio_features = self.embed_audio(mel)
         
+        # Use sot_sequence for multilingual models (includes language and task tokens)
+        initial_tokens = self.tokenizer.sot_sequence if hasattr(self.tokenizer, 'sot_sequence') else [self.tokenizer.sot]
         tokens = torch.LongTensor([
-            self.tokenizer.sot
-        ]).cuda()[None, ...]
+            initial_tokens
+        ]).cuda()
 
         for i in range(self.dims.n_text_ctx):
             logits = self.logits(tokens, audio_features)
@@ -174,7 +176,9 @@ class WhisperTRT(nn.Module):
             tokens = torch.cat([tokens, next_tokens[:, -1:]], dim=-1)
             if tokens[0, -1] == self.tokenizer.eot:
                 break
-        tokens = tokens[:, 2:]
+        
+        num_skip_tokens = len(initial_tokens) + 1  # +1 for the language token that gets added
+        tokens = tokens[:, num_skip_tokens:]
         tokens = tokens[:, :-1]
         text = self.tokenizer.decode(list([int(x) for x in tokens.flatten()]))
         
@@ -316,6 +320,54 @@ class WhisperTRTBuilder:
         }
 
         torch.save(checkpoint, output_path)
+    
+    @classmethod
+    @torch.no_grad()
+    def build_sequential(cls, output_path: str, verbose: bool = False):
+        """
+        Build TensorRT engines sequentially to minimize peak memory usage.
+        This is useful for memory-constrained devices like Jetson.
+        
+        Unlike the standard build() method which builds both engines in one call,
+        this method builds encoder and decoder separately, freeing memory between steps.
+        """
+        import gc
+        cls.verbose = verbose
+        
+        # Get model dimensions
+        dims = asdict(load_model(cls.model).dims)
+        
+        # Build and save audio encoder
+        if verbose:
+            print("Building audio encoder engine...")
+        audio_encoder_engine = cls.build_audio_encoder_engine()
+        audio_encoder_state = audio_encoder_engine.state_dict()
+        audio_encoder_extra = cls.get_audio_encoder_extra_state()
+        del audio_encoder_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Build and save text decoder
+        if verbose:
+            print("Building text decoder engine...")
+        text_decoder_engine = cls.build_text_decoder_engine()
+        text_decoder_state = text_decoder_engine.state_dict()
+        text_decoder_extra = cls.get_text_decoder_extra_state()
+        del text_decoder_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Create checkpoint
+        checkpoint = {
+            "whisper_trt_version": __version__,
+            "dims": dims,
+            "text_decoder_engine": text_decoder_state,
+            "text_decoder_extra_state": text_decoder_extra,
+            "audio_encoder_engine": audio_encoder_state,
+            "audio_encoder_extra_state": audio_encoder_extra
+        }
+
+        torch.save(checkpoint, output_path)
 
     @classmethod
     def get_tokenizer(cls):
@@ -380,6 +432,22 @@ class EnBuilder(WhisperTRTBuilder):
         return tokenizer
 
 
+class MultilingualBuilder(WhisperTRTBuilder):
+    language: str = "es"  # Default to Spanish, can be overridden
+    max_workspace_size: int = 1 << 28  # 256MB instead of 1GB for limited GPU memory
+    
+    @classmethod
+    def get_tokenizer(cls):
+        model = load_model(cls.model)
+        tokenizer = whisper.tokenizer.get_tokenizer(
+            model.is_multilingual,
+            num_languages=model.num_languages,
+            language=cls.language,
+            task="transcribe",
+        )
+        return tokenizer
+
+
 class TinyEnBuilder(EnBuilder):
     model: str = "tiny.en"
     
@@ -390,21 +458,39 @@ class BaseEnBuilder(EnBuilder):
 
 class SmallEnBuilder(EnBuilder):
     model: str = "small.en"
+
+
+class TinyBuilder(MultilingualBuilder):
+    model: str = "tiny"
+    
+
+class BaseBuilder(MultilingualBuilder):
+    model: str = "base"
+
+
+class SmallBuilder(MultilingualBuilder):
+    model: str = "small"
     
 
 MODEL_FILENAMES = {
     "tiny.en": "tiny_en_trt.pth",
     "base.en": "base_en_trt.pth",
-    "small.en": "small_en_trt.pth"
+    "small.en": "small_en_trt.pth",
+    "tiny": "tiny_trt.pth",
+    "base": "base_trt.pth",
+    "small": "small_trt.pth"
 }
 
 MODEL_BUILDERS = {
     "tiny.en": TinyEnBuilder,
     "base.en": BaseEnBuilder,
-    "small.en": SmallEnBuilder
+    "small.en": SmallEnBuilder,
+    "tiny": TinyBuilder,
+    "base": BaseBuilder,
+    "small": SmallBuilder
 }
 
-def load_trt_model(name: str, path: str | None = None, build: bool = True, verbose: bool = False):
+def load_trt_model(name: str, path: str | None = None, build: bool = True, verbose: bool = False, language: str = "es"):
 
     if name not in MODEL_BUILDERS:
         raise RuntimeError(f"Model '{name}' is not supported by WhisperTRT.")
@@ -414,6 +500,10 @@ def load_trt_model(name: str, path: str | None = None, build: bool = True, verbo
         make_cache_dir()
 
     builder = MODEL_BUILDERS[name]
+    
+    # Set language for multilingual models
+    if hasattr(builder, 'language'):
+        builder.language = language
 
     if not os.path.exists(path):
         if not build:
@@ -421,4 +511,12 @@ def load_trt_model(name: str, path: str | None = None, build: bool = True, verbo
         else:
             builder.build(path, verbose=verbose)
 
-    return builder.load(path)
+    # Load the model
+    model = builder.load(path)
+    
+    # Re-create tokenizer with the correct language for multilingual models
+    if hasattr(builder, 'language'):
+        tokenizer = builder.get_tokenizer()
+        model.tokenizer = tokenizer
+    
+    return model
